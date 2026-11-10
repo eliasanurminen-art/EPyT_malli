@@ -33,6 +33,7 @@ import warnings
 import importlib.util
 import io
 import os
+import time
 
 import numpy as np
 
@@ -49,6 +50,7 @@ G = 9.81                          # m/s2
 INTERAKTIIVINEN = True            # False = aja simulointi ja vertailu suoraan
 VERTAA_KANDI4 = True              # verrataanko tuloksia Kandi4.0:aan
 KANDI4_TIEDOSTO = "Kandi4.0.py"
+VERTAILULINKIT = [1, 3, 5, 7]     # linkit, joiden tulokset tulostetaan aina (samat kuin Kandi4.0:ssa)
 
 # EPANETin viskositeetin perusarvo (suhteellinen viskositeetti 1,0 = 1,1e-5 ft2/s)
 NU_EPANET_PERUS = 1.1e-5 * 0.3048 ** 2   # m2/s
@@ -253,12 +255,15 @@ def aja_epyt_simulointi(a: dict, inp: str) -> dict:
     from epyt_flow.simulation import ScenarioSimulator
     warnings.filterwarnings("ignore", message=".*negative pressures.*")   # tulostetaan itse alla
 
+    t_alku = time.perf_counter()               # mallin lataus + simulointi
     with ScenarioSimulator(f_inp_in=inp) as sim:
         linkit = [putki_id(i) for i in range(len(a["edges"]))]
         solmut = [solmu_id(i) for i in range(a["n_solmut"])]
         sim.set_flow_sensors(sensor_locations=linkit)
         sim.set_pressure_sensors(sensor_locations=solmut)
+        t_sim = time.perf_counter()
         scada = sim.run_hydraulic_simulation()
+        aika_sim = time.perf_counter() - t_sim     # pelkkä EPANETin hydraulinen ratkaisu
 
         Q_lps = np.asarray(scada.get_data_flows(sensor_locations=linkit))[0]
         P_m = np.asarray(scada.get_data_pressures(sensor_locations=solmut))[0]
@@ -274,7 +279,8 @@ def aja_epyt_simulointi(a: dict, inp: str) -> dict:
     H[0] = a["P_juuri"] / (rho * G)    # EPANET ilmoittaa syöttösolmun (reservoir) paineeksi 0
     edges = a["edges"]
     h = H[edges[:, 0]] - H[edges[:, 1]]  # linkin painehäviö nimellissuunnassa
-    return {"Q": Q, "H": H, "h": h, "yksikko": yks}
+    aika = time.perf_counter() - t_alku
+    return {"Q": Q, "H": H, "h": h, "yksikko": yks, "aika": aika, "aika_sim": aika_sim}
 
 
 def _yksikon_nimi(koodi) -> str:
@@ -289,6 +295,13 @@ def _yksikon_nimi(koodi) -> str:
 # ============================================================================
 # 3) TULOSTEN TULOSTUS JA VERTAILU
 # ============================================================================
+def valitut_linkit(a: dict) -> list[int]:
+    """Palauttaa tulostettavat linkit: ensin SML:t, sitten VERTAILULINKIT.
+    Linkin indeksi on sen rivi edges-taulukossa, joten se on sama kuin Kandi4.0:ssa."""
+    sml = [int(x) for x in a["sml"]]
+    return sml + [x for x in VERTAILULINKIT if x not in sml]
+
+
 def tulosta_tulokset(a: dict, tulos: dict):
     """Tulostaa EPANETin tulokset: ensin SML:t (virtaus, painehäviö, syklin
     sulkeutuminen), sitten yhteenvedon kaikista linkeistä."""
@@ -301,15 +314,16 @@ def tulosta_tulokset(a: dict, tulos: dict):
     print(f"Syöttö 0-solmusta: {Q[edges[:, 0] == 0].sum():.6f} m3/s, "
           f"kulutus yhteensä {a['kulutus'].sum():.6f} m3/s")
 
-    print("\n--- SYKLIN MERKKAAVAT LINKIT (SML) ---")
-    for s in a["sml"]:
-        u, v = edges[s]
-        A = np.pi * a["D"][s] ** 2 / 4
-        print(f"SML {s}: {u} -> {v}")
-        print(f"   Q        = {Q[s]: .6e} m3/s  ({Q[s] * 1000:.4f} l/s)"
-              f"{'  (virtaus nimellissuuntaa vastaan)' if Q[s] < 0 else ''}")
-        print(f"   v        = {Q[s] / A: .4f} m/s")
-        print(f"   h_loss   = {h[s]: .6f} m   (H[{u}] = {H[u]:.4f} m, H[{v}] = {H[v]:.4f} m)")
+    print("\n--- SML:T JA VERTAILULINKIT " + ", ".join(str(x) for x in VERTAILULINKIT) + " ---")
+    A = np.pi * a["D"] ** 2 / 4
+    print(f"{'linkki':>6} {'u->v':>9} {'Q [m3/s]':>13} {'v [m/s]':>9} {'h [m]':>11} {'H_u [m]':>10} {'H_v [m]':>10}")
+    for i in valitut_linkit(a):
+        if i >= len(edges):
+            print(f"{i:6d}   (verkossa ei ole näin montaa linkkiä)")
+            continue
+        u, v = edges[i]
+        tunniste = "  <- SML" if i in a["sml"] else ""
+        print(f"{i:6d} {f'{u}->{v}':>9} {Q[i]:13.6e} {Q[i] / A[i]:9.4f} {h[i]:11.5f} {H[u]:10.3f} {H[v]:10.3f}{tunniste}")
 
     print("\n--- KAIKKI LINKIT (10 suurinta virtausta ja SML:t) ---")
     print(f"{'linkki':>6} {'u->v':>9} {'Q [l/s]':>11} {'h [m]':>11}")
@@ -317,7 +331,9 @@ def tulosta_tulokset(a: dict, tulos: dict):
     for i in nayta:
         u, v = edges[i]
         print(f"{i:6d} {f'{u}->{v}':>9} {Q[i] * 1000:11.5f} {h[i]:11.5f}{'  <- SML' if i in a['sml'] else ''}")
-    print(f"\nPienin painekorkeus: {H.min():.3f} m (solmu {int(np.argmin(H))})"
+    print(f"\nEPANET-laskenta-aika: {tulos['aika_sim'] * 1000:.1f} ms "
+          f"(mallin lataus + simulointi {tulos['aika'] * 1000:.1f} ms)")
+    print(f"Pienin painekorkeus: {H.min():.3f} m (solmu {int(np.argmin(H))})"
           f"{'  <- negatiivinen paine: syöttöpaine ei riitä tälle verkolle' if H.min() < 0 else ''}")
 
 
@@ -359,10 +375,22 @@ def vertaa_kandi4(a: dict, tulos: dict):
     print("VERTAILU: Sykli-Analysoija (Kandi4.0) vs. EPANET (EPyT-Flow)")
     print("=" * 72)
     if iteraatiot: print("Kandi4.0: " + iteraatiot[0])
-    for s in a["sml"]:
-        print(f"SML {s}: Q_SA = {Q_sa[s]:.6e}  Q_EPANET = {Q_ep[s]:.6e} m3/s  "
-              f"ero {abs(Q_sa[s] - Q_ep[s]) / max(abs(Q_ep[s]), 1e-12) * 100:.3f} %")
-        print(f"        h_SA = {h_sa[s]:.6f}  h_EPANET = {h_ep[s]:.6f} m")
+    aika_rivi = [r for r in loki.getvalue().splitlines() if r.startswith("Laskenta-aika")]
+    if aika_rivi: print("Kandi4.0: " + aika_rivi[0])
+    print(f"EPANET:   Laskenta-aika {tulos['aika_sim'] * 1000:.1f} ms "
+          f"(mallin lataus + simulointi {tulos['aika'] * 1000:.1f} ms)\n")
+    print(f"{'linkki':>6} {'u->v':>9} {'Q_SA [m3/s]':>13} {'Q_EPANET':>13} {'ero Q':>9} "
+          f"{'h_SA [m]':>10} {'h_EPANET':>10} {'ero h':>8}")
+    for i in valitut_linkit(a):
+        if i >= len(Q_sa):
+            print(f"{i:6d}   (verkossa ei ole näin montaa linkkiä)")
+            continue
+        u, v = a["edges"][i]
+        eQ = abs(Q_sa[i] - Q_ep[i]) / max(abs(Q_ep[i]), 1e-12) * 100
+        eh = abs(h_sa[i] - h_ep[i]) / max(abs(h_ep[i]), 1e-12) * 100
+        print(f"{i:6d} {f'{u}->{v}':>9} {Q_sa[i]:13.6e} {Q_ep[i]:13.6e} {eQ:8.3f}% "
+              f"{h_sa[i]:10.4f} {h_ep[i]:10.4f} {eh:7.3f}%{'  <- SML' if i in a['sml'] else ''}")
+    print()
     print(f"Tilavuusvirrat, kaikki linkit: suurin ero {dQ.max():.3e} m3/s, "
           f"suurin suhteellinen ero {rel.max() * 100:.4f} % (linkki {int(np.argmax(rel))}), "
           f"keskimäärin {rel.mean() * 100:.4f} %")
@@ -389,7 +417,9 @@ def _kysy_luku(teksti: str, oletus=None, tyyppi=float):
 
 def simuloi_ja_tulosta(a: dict):
     """Kirjoittaa .inp-tiedoston, ajaa EPANETin ja tulostaa tulokset ja vertailun."""
+    t0 = time.perf_counter()
     inp = kirjoita_inp(a)
+    print(f"[EPyT] .inp-tiedoston kirjoitus: {(time.perf_counter() - t0) * 1000:.1f} ms")
     tulos = aja_epyt_simulointi(a, inp)
     tulosta_tulokset(a, tulos)
     if VERTAA_KANDI4:
