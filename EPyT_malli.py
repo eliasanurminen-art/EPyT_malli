@@ -49,8 +49,8 @@ XI_PAIKALLIS = 1.5                # paikallishäviökerroin
 G = 9.81                          # m/s2
 INTERAKTIIVINEN = True            # False = aja simulointi ja vertailu suoraan
 VERTAA_KANDI4 = True              # verrataanko tuloksia Kandi4.0:aan
+Q_RAJA = 1e-5                     # m3/s, tätä pienemmät virtaukset jätetään suhteellisen eron ulkopuolelle
 KANDI4_TIEDOSTO = "Kandi4.0.py"
-VERTAILULINKIT = [1, 3, 5, 7]     # linkit, joiden tulokset tulostetaan aina (samat kuin Kandi4.0:ssa)
 
 # EPANETin viskositeetin perusarvo (suhteellinen viskositeetti 1,0 = 1,1e-5 ft2/s)
 NU_EPANET_PERUS = 1.1e-5 * 0.3048 ** 2   # m2/s
@@ -296,10 +296,9 @@ def _yksikon_nimi(koodi) -> str:
 # 3) TULOSTEN TULOSTUS JA VERTAILU
 # ============================================================================
 def valitut_linkit(a: dict) -> list[int]:
-    """Palauttaa tulostettavat linkit: ensin SML:t, sitten VERTAILULINKIT.
-    Linkin indeksi on sen rivi edges-taulukossa, joten se on sama kuin Kandi4.0:ssa."""
-    sml = [int(x) for x in a["sml"]]
-    return sml + [x for x in VERTAILULINKIT if x not in sml]
+    """Palauttaa tulostettavat linkit eli SML:t. Linkin indeksi on sen rivi
+    edges-taulukossa, joten se on sama kuin Kandi4.0:ssa."""
+    return [int(x) for x in a["sml"]]
 
 
 def tulosta_tulokset(a: dict, tulos: dict):
@@ -314,13 +313,10 @@ def tulosta_tulokset(a: dict, tulos: dict):
     print(f"Syöttö 0-solmusta: {Q[edges[:, 0] == 0].sum():.6f} m3/s, "
           f"kulutus yhteensä {a['kulutus'].sum():.6f} m3/s")
 
-    print("\n--- SML:T JA VERTAILULINKIT " + ", ".join(str(x) for x in VERTAILULINKIT) + " ---")
+    print("\n--- SYKLIN MERKKAAVAT LINKIT (SML) ---")
     A = np.pi * a["D"] ** 2 / 4
     print(f"{'linkki':>6} {'u->v':>9} {'Q [m3/s]':>13} {'v [m/s]':>9} {'h [m]':>11} {'H_u [m]':>10} {'H_v [m]':>10}")
     for i in valitut_linkit(a):
-        if i >= len(edges):
-            print(f"{i:6d}   (verkossa ei ole näin montaa linkkiä)")
-            continue
         u, v = edges[i]
         tunniste = "  <- SML" if i in a["sml"] else ""
         print(f"{i:6d} {f'{u}->{v}':>9} {Q[i]:13.6e} {Q[i] / A[i]:9.4f} {h[i]:11.5f} {H[u]:10.3f} {H[v]:10.3f}{tunniste}")
@@ -369,7 +365,10 @@ def vertaa_kandi4(a: dict, tulos: dict):
     Q_sa, h_sa = Q_features[:, 6], Q_features[:, 8]
     Q_ep, h_ep = tulos["Q"], tulos["h"]
     dQ = np.abs(Q_sa - Q_ep)
-    rel = dQ / np.maximum(np.abs(Q_ep), 1e-12)
+    # Lähes virrattomissa linkeissä (|Q| < Q_RAJA) suhteellinen ero kasvaa harhaanjohtavan
+    # suureksi, vaikka absoluuttinen ero on pieni, joten ne jätetään suhteellisen eron ulkopuolelle.
+    mukana = np.abs(Q_ep) >= Q_RAJA
+    rel = np.where(mukana, dQ / np.maximum(np.abs(Q_ep), 1e-12), 0.0)
 
     print("\n" + "=" * 72)
     print("VERTAILU: Sykli-Analysoija (Kandi4.0) vs. EPANET (EPyT-Flow)")
@@ -382,9 +381,6 @@ def vertaa_kandi4(a: dict, tulos: dict):
     print(f"{'linkki':>6} {'u->v':>9} {'Q_SA [m3/s]':>13} {'Q_EPANET':>13} {'ero Q':>9} "
           f"{'h_SA [m]':>10} {'h_EPANET':>10} {'ero h':>8}")
     for i in valitut_linkit(a):
-        if i >= len(Q_sa):
-            print(f"{i:6d}   (verkossa ei ole näin montaa linkkiä)")
-            continue
         u, v = a["edges"][i]
         eQ = abs(Q_sa[i] - Q_ep[i]) / max(abs(Q_ep[i]), 1e-12) * 100
         eh = abs(h_sa[i] - h_ep[i]) / max(abs(h_ep[i]), 1e-12) * 100
@@ -393,7 +389,11 @@ def vertaa_kandi4(a: dict, tulos: dict):
     print()
     print(f"Tilavuusvirrat, kaikki linkit: suurin ero {dQ.max():.3e} m3/s, "
           f"suurin suhteellinen ero {rel.max() * 100:.4f} % (linkki {int(np.argmax(rel))}), "
-          f"keskimäärin {rel.mean() * 100:.4f} %")
+          f"keskimäärin {rel[mukana].mean() * 100:.4f} %")
+    if (~mukana).any():
+        print(f"   ({int((~mukana).sum())} lähes virratonta linkkiä (|Q| < {Q_RAJA} m3/s) ei mukana "
+              f"suhteellisessa erossa: {np.where(~mukana)[0].tolist()}, niiden suurin absoluuttinen ero "
+              f"{dQ[~mukana].max():.2e} m3/s)")
     print(f"Painehäviöt: suurin ero {np.abs(h_sa - h_ep).max():.3e} m")
     print("Huom: EPANET laskee kitkakertoimen Swamee–Jain-likiarvolla, Kandi4.0 ratkaisee "
           "Colebrook–Whiten tarkasti.\n      Tästä syntyy noin 1 %:n ero painehäviöihin, vaikka virtaukset täsmäävät.")
